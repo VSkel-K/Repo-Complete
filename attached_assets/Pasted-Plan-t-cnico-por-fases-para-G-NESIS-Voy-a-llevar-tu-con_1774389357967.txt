@@ -1,0 +1,395 @@
+Plan técnico por fases para GÉNESIS
+
+Voy a llevar tu condición hasta el final: este plan está diseñado para que un agente pueda generar un repo real, dejarlo listo para commit, pasar CI, levantar una API, analizar un repo Kotlin, y compilar una app Android visor sin que después haya que “salvar” la idea con cirugía manual. Por eso no te propongo la arquitectura más romántica; te propongo la más construible. Cuando haga una elección, priorizo cuatro cosas: reproducibilidad, precisión suficiente, bajo caos operativo y capacidad de entrega.  
+
+Mi conclusión práctica es esta: GÉNESIS v0.2 debe ser un monorepo Kotlin-first, con backend en Kotlin, motor de indexado incremental, modelo lógico de grafo, persistencia simple y una capa IA opcional, nunca obligatoria para que el sistema funcione. La justificación técnica está alineada con cómo el ecosistema modela código: JetBrains define PSI como la capa que parsea archivos y crea el modelo sintáctico y semántico; su API de símbolos desacopla la semántica del árbol físico; KSP trabaja a nivel símbolo y entiende rasgos propios de Kotlin; Tree-sitter aporta parsing incremental eficiente; y LSP formaliza la idea de sincronización incremental de cambios. JetBrains PSI JetBrains Symbols KSP Tree-sitter LSP 3.17
+
+Stack definitivo propuesto
+
+No te voy a dar “opciones”; te voy a dar una apuesta concreta.
+
+| Capa | Stack elegido | Motivo |
+|---|---|---|
+| Lenguaje principal | Kotlin/JVM | Unifica backend, contratos, tooling y Android |
+| Build | Gradle Kotlin DSL | Estándar, automatizable, excelente en CI |
+| API backend | Ktor | Ligero, claro, más simple que Spring para un MVP |
+| Persistencia | SQLite + Exposed | Cero fricción, portable, fácil en CI |
+| Modelo lógico | Grafo sobre tablas relacionales | Grafo semántico sin meter complejidad de Neo4j en MVP |
+| Parser incremental | Tree-sitter Kotlin | Muy rápido para bootstrap y reindexado incremental |
+| Enriquecimiento semántico | Adaptador Kotlin semantic layer (fase 2) | Solo cuando haga falta precisión extra |
+| Serialización | kotlinx.serialization | Contratos limpios, multiplataforma |
+| Test | JUnit 5 + Kotest | Legibles y fáciles de generar por agentes |
+| Android viewer | Jetpack Compose | UI rápida, poco boilerplate |
+| CI/CD | GitHub Actions | Build reproducible, APK como artefacto |
+| Contenedorización | Docker | Backend desplegable sin sorpresas |
+| IA | Proveedor opcional vía interfaz | Si falla o falta, GÉNESIS sigue funcionando |
+
+La elección de modelo lógico de grafo no es caprichosa. Un sistema como GÉNESIS necesita tratar las relaciones como entidades de primera clase — llamadas, imports, usos de tipo, lecturas, escrituras, herencia, overrides—, y eso encaja mucho mejor con un grafo que con un árbol rígido. Neo4j lo explica con claridad: los grafos almacenan nodos y relaciones de forma natural y evitan forzar conexiones complejas mediante joins. Ahora bien, para un MVP entregable por agentes, lo correcto no es meter Neo4j aún, sino modelar como grafo y persistir de forma sobria. Neo4j
+
+Principio operativo que gobernará todas las fases
+
+Cada fase empieza y termina con la misma pregunta:
+
+¿Lo que acabamos de diseñar puede salir de aquí como repo, commit, CI verde y artefacto funcional?
+
+Si la respuesta no es “sí”, la fase no se considera cerrada.
+
+Roadmap por fases
+
+Fase 0 — Fundaciones de entrega
+
+Objetivo
+Crear un esqueleto de repo que ya pueda compilar, testear, publicar artefactos y aceptar crecimiento sin volverse barro.
+
+Salida exigible
+Un monorepo con estos módulos:
+
+/genesis
+  /apps/api
+  /apps/android-viewer
+  /libs/contracts
+  /libs/indexer
+  /libs/ledger
+  /libs/rules
+  /libs/explain
+  /sample-repos/kotlin-demo
+  /.github/workflows
+
+Qué se implementa
+Aquí no se “analiza código” todavía; aquí se instala el suelo. Se crea el build raíz con Gradle Kotlin DSL, version catalog, configuración común de Kotlin, linters, tests mínimos y workflows de GitHub Actions para backend y Android. El backend debe arrancar con un /health, y la app Android debe compilar aunque solo enseñe “GÉNESIS Viewer”. Esta fase acaba únicamente cuando el repo se puede clonar y compilar de punta a punta sin tocar nada manualmente.
+
+Stack de la fase
+- Kotlin 2.x
+- Gradle Kotlin DSL
+- Ktor
+- Compose Android
+- JUnit 5
+- GitHub Actions
+
+Criterio de salida
+- ./gradlew build en CI pasa.
+- Se genera un artefacto APK.
+- La API arranca en local y responde a /health.
+- Existe un repo de ejemplo dentro de sample-repos.
+
+Pregunta de control al principio y al final
+Sí, esta fase es generable por agentes y entregable en GitHub Actions. Si no lo es, el diseño está mal.
+
+Fase 1 — Indexación base de Kotlin
+
+Objetivo
+Extraer del repositorio una estructura canónica mínima y estable: archivos, paquetes, clases, funciones, propiedades e imports.
+
+Qué se implementa
+Aquí nace el Agente A real, aunque ya no será un LLM sino el Motor de Captura Semántica. El módulo libs/indexer leerá archivos .kt, recorrerá el árbol sintáctico y emitirá eventos internos como FILE_INDEXED, SYMBOL_INDEXED, IMPORT_FOUND.
+
+La razón de empezar con parsing incremental es simple: necesitamos reindexar por cambios, no reconstruir el universo en cada edición. Tree-sitter se define como generador de parsers y librería de parsing incremental capaz de construir y actualizar eficientemente el árbol sintáctico mientras se edita el archivo, con velocidad suficiente para operar incluso por pulsación en tooling. Eso justifica usarlo como base del MVP. Tree-sitter
+
+Qué NO se implementa aún
+No se resuelven todavía llamadas complejas, no se infiere flow analysis y no se prometen usos/refs perfectos. Primero se captura bien lo estructural.
+
+Contratos que ya deben existir
+SymbolRecord
+FileRecord
+ImportRecord
+IndexEvent
+
+Criterio de salida
+Dado un repo Kotlin simple, GÉNESIS produce un snapshot JSON interno con:
+- todos los archivos Kotlin,
+- paquete,
+- imports,
+- definiciones top-level,
+- clases,
+- funciones,
+- propiedades.
+
+Riesgo principal
+Querer resolver semántica profunda demasiado pronto. Eso rompe ritmo y mete caos.
+
+Decisión importante
+Aquí no usamos IA. Cero. La fase debe funcionar completamente offline.
+
+Fase 2 — Libro contable y grafo canónico
+
+Objetivo
+Convertir la indexación base en una representación estable y consultable: el “libro contable” deja de ser un JSON plano y pasa a ser un grafo lógico con snapshots.
+
+Qué se implementa
+El módulo libs/ledger recibe eventos del indexador y los normaliza en cuatro tablas esenciales:
+
+- symbols
+- relations
+- snapshots
+- issues (vacía de momento, pero ya creada)
+
+Aunque el almacenamiento sea SQLite, el dominio se comporta como grafo. Esta fase introduce tipos de relación básicos:
+- DECLARES
+- IMPORTS
+- CONTAINS
+- USES_TYPE
+- CALLS solo cuando sea resoluble con seguridad suficiente
+
+La idea de usar un grafo como verdad y un árbol solo como proyección visual está mejor alineada con sistemas serios de code intelligence. También acerca GÉNESIS a enfoques más verificables y consultables, algo que recuerda a cómo CodeQL trabaja sobre representaciones formales del programa y consultas analíticas, no sobre intuición narrativa. CodeQL
+
+Criterio de salida
+- Cada símbolo tiene ID canónico.
+- Cada relación tiene procedencia.
+- Puede generarse un snapshot completo por commit o por ejecución.
+- Puede reconstruirse un árbol de visualización a partir del grafo.
+
+Pregunta de control
+¿Esto puede salir como repo funcional y no como promesa abstracta? Sí, porque aquí ya habrá persistencia, consultas y serialización, no solo ideas.
+
+Fase 3 — Reindexado incremental y diff
+
+Objetivo
+Evitar la reconstrucción total salvo en bootstrap. Esta fase convierte GÉNESIS en herramienta y deja de ser “script bonito”.
+
+Qué se implementa
+Se añade un motor de reindexado por archivo cambiado:
+1. detecta archivos modificados,
+2. invalida subgrafo asociado,
+3. reparsea solo lo necesario,
+4. emite nuevo snapshot,
+5. calcula diff contra snapshot anterior.
+
+La lógica incremental está totalmente justificada por el ecosistema. LSP soporta sincronización incremental mediante didChange, además de sync completo, precisamente para no recalcular todo cada vez. Esa filosofía debe reflejarse en GÉNESIS desde el diseño. LSP 3.17
+
+Salida visible
+Aparece el endpoint /projects/:id/diff, y ya se puede responder a preguntas como:
+- qué símbolos cambiaron,
+- qué relaciones se añadieron o desaparecieron,
+- qué impacto potencial se abrió.
+
+Criterio de salida
+Un cambio local en un archivo no debe provocar reindexación completa del repo, salvo cuando el sistema detecte que no puede mantener consistencia.
+
+Riesgo
+Tentar a la fase a resolver “impacto total”. Todavía no. Aquí solo diff estructural fiable.
+
+Fase 4 — Motor de reglas y deuda técnica
+
+Objetivo
+Hacer que el libro contable diga algo útil. Aquí nace el Agente B real: no un LLM auditor, sino un Motor de Auditoría.
+
+Reglas iniciales
+- DECLARED_UNUSED
+- UNRESOLVED_REFERENCE
+- API_SIGNATURE_CHANGED
+- CYCLIC_DEPENDENCY
+- ORPHAN_FILE
+- MISSING_IMPORT_CANDIDATE si la evidencia es suficiente
+
+Qué cambia de verdad
+Aquí GÉNESIS deja de “mostrar estructura” y empieza a producir decisiones. Cada hallazgo debe incluir:
+- símbolo afectado,
+- evidencia,
+- severidad,
+- procedencia,
+- acción sugerida.
+
+La idea de análisis explicable y basado en representación formal vuelve a tener apoyo en enfoques como CodeQL, donde el valor está en poder razonar sobre estructura, flujo y consultas verificables. CodeQL CodeQL Java/Kotlin
+
+Criterio de salida
+Sobre un repo de prueba preparado, el sistema debe detectar al menos:
+- una referencia no resuelta,
+- un símbolo no usado,
+- una diferencia de firma entre snapshots.
+
+Lo que aún no entra
+No hay refactor automático. Solo hallazgo + explicación mínima + sugerencia.
+
+Fase 5 — API pública y visor Android
+
+Objetivo
+Volver consumible el sistema sin depender de herramientas internas.
+
+Endpoints mínimos
+- POST /projects/ingest
+- POST /projects/{id}/index
+- POST /projects/{id}/reindex
+- GET /projects/{id}/graph
+- GET /projects/{id}/tree
+- GET /projects/{id}/issues
+- GET /projects/{id}/diff
+- GET /projects/{id}/balance
+
+App Android
+La app android-viewer no tiene que ser espectacular; tiene que ser útil y compilable. Debe incluir:
+- lista de proyectos,
+- vista árbol,
+- vista issues,
+- vista diff,
+- vista detalle de símbolo.
+
+Por qué esta fase importa tanto
+Porque aquí se prueba si GÉNESIS es un componente real del ecosistema MNEMO o si sigue siendo una idea autocontenida. El visor obliga a que los contratos sean claros y estables.
+
+Criterio de salida
+- APK compilado en CI.
+- La app consume un backend levantado por Docker o local.
+- Un usuario puede navegar árbol, issues y diff.
+
+Fase 6 — Capa de explicación IA, pero subordinada
+
+Objetivo
+Añadir inteligencia narrativa sin convertirla en cimiento.
+
+Qué se implementa
+El módulo libs/explain define una interfaz como esta:
+
+interface ExplainProvider {
+    suspend fun explainIssue(issue: IssueRecord, context: ExplainContext): Explanation
+    suspend fun summarizeDiff(diff: DiffRecord): Summary
+}
+
+Habrá dos implementaciones:
+- NoopExplainProvider
+- RemoteLlmExplainProvider
+
+Eso significa que GÉNESIS puede desplegarse y funcionar sin IA. Si la IA está disponible, mejora la experiencia. Si no, el producto sigue vivo. Esa separación es esencial para que el repo sea entregable y no dependa de una llave externa o de comportamiento impredecible del modelo.
+
+Qué sí hace la IA
+- explicar por qué una regla saltó,
+- resumir impacto,
+- ordenar hallazgos por prioridad,
+- proponer acciones humanas.
+
+Qué no hace
+- no crea la verdad base,
+- no construye el grafo,
+- no borra o modifica código automáticamente.
+
+Criterio de salida
+Si el proveedor IA falla, el sistema sigue indexando, auditando y respondiendo API.
+
+Fase 7 — Precisión semántica extra para Kotlin
+
+Objetivo
+Mejorar calidad sin reventar la entregabilidad.
+
+Qué se implementa
+Aquí sí tiene sentido añadir un adaptador semántico más profundo para casos donde el parser incremental no basta. La referencia conceptual correcta la dan las APIs de símbolos y modelos semánticos del ecosistema Kotlin/JetBrains: PSI crea el modelo sintáctico y semántico que alimenta tooling; la API de símbolos representa elementos semánticos y los conecta con navegación y usos; KSP trabaja a nivel símbolo y entiende detalles específicos de Kotlin. JetBrains PSI JetBrains Symbols KSP
+
+Casos que mejora esta fase
+- overload resolution más preciso,
+- jerarquías extends / implements,
+- override,
+- usos de tipo más exactos,
+- mejor calidad en CALLS.
+
+Criterio de salida
+Sube la precisión de referencias y relaciones complejas sobre el benchmark interno sin romper tiempos razonables.
+
+Aviso importante
+Esta fase solo entra cuando las anteriores ya están en verde. Antes sería barro.
+
+Fase 8 — Endurecimiento para producción ligera
+
+Objetivo
+Cerrar el MVP con garantías de adopción temprana.
+
+Qué se implementa
+- timeouts
+- reintentos controlados
+- locks por proyecto
+- limpieza de snapshots viejos
+- métricas básicas
+- logs estructurados
+- importación por ZIP y Git
+- Docker image
+- documentación operativa mínima
+
+Criterio de salida
+Cualquier tercero debe poder:
+1. clonar,
+2. configurar variables mínimas,
+3. levantar backend,
+4. indexar el repo demo,
+5. abrir la app Android,
+6. ver resultados.
+
+Ese es el verdadero “está hecho”.
+
+Orden recomendado de ejecución real
+
+Tramo 1 — Semanas 1 y 2
+Se hace Fase 0 y Fase 1. El objetivo no es tener inteligencia, sino tener un repo serio que compila y ya produce índice estructural básico.
+
+Tramo 2 — Semanas 3 y 4
+Se hace Fase 2 y Fase 3. Aquí aparece el libro contable real, snapshots y diff incremental.
+
+Tramo 3 — Semanas 5 y 6
+Se hace Fase 4 y Fase 5. Aquí GÉNESIS ya es demostrable: detecta issues, expone API y tiene APK visor.
+
+Tramo 4 — Semanas 7 y 8
+Se hace Fase 6. La IA entra solo después de que el producto sea funcional sin ella.
+
+Tramo 5 — Semanas 9 a 10
+Se hace Fase 7 y parte de la 8 si la calidad lo pide. Si no, se pospone para mantener foco.
+
+Backlog de commits recomendado
+
+Para que un agente no improvise demasiado, yo impondría este orden de commits:
+
+1. chore: bootstrap monorepo kotlin gradle ktor compose
+2. ci: add backend and android github actions
+3. feat(contracts): add project symbol relation issue schemas
+4. feat(api): add health endpoint and project shell
+5. feat(indexer): parse kotlin files and emit base symbol events
+6. feat(ledger): persist symbols relations and snapshots in sqlite
+7. feat(diff): add incremental reindex and snapshot diff
+8. feat(rules): add unresolved reference and declared unused rules
+9. feat(api): expose graph tree issues diff endpoints
+10. feat(android): add project list tree issues diff screens
+11. feat(explain): add optional llm explain provider interface
+12. hardening: add timeouts locks logging docker docs
+
+Ese orden minimiza retrabajo y evita que la UI o la IA empujen decisiones prematuras en el core.
+
+Qué descartaría explícitamente en esta versión
+
+No intentaría multilenguaje todavía.  
+No intentaría plugin IntelliJ.  
+No intentaría refactor automático.  
+No intentaría Neo4j en la primera entrega.  
+No intentaría que los LLM “escuchen el código” como verdad primaria.  
+
+Todo eso puede sonar menos épico, pero te protege de convertir una idea buena en un sistema ingobernable.
+
+Criterios de aceptación finales del MVP
+
+Cuando cierres el MVP, yo exigiría esto y nada menos:
+
+| Área | Aceptación |
+|---|---|
+| Build | Monorepo compila íntegro en CI |
+| API | Backend responde y expone endpoints clave |
+| Indexado | Repo Kotlin demo indexado sin fallo |
+| Incrementalidad | Cambiar un archivo no reindexa todo salvo necesidad explícita |
+| Ledger | Snapshot y diff persistidos |
+| Reglas | Al menos 3 clases de issue funcionan |
+| Android | APK demo generado y navegable |
+| Robustez | La ausencia de IA no rompe el producto |
+| Observabilidad | Logs y errores razonables |
+
+Mi recomendación final de stack, sin ambigüedad
+
+Si me obligaras a fijarlo hoy para construir mañana, yo cerraría así:
+
+- Monorepo Gradle Kotlin
+- Backend Ktor
+- SQLite + Exposed
+- Tree-sitter Kotlin para indexado incremental
+- Capa semántica extra solo en fase posterior
+- Jetpack Compose para visor Android
+- GitHub Actions para CI y APK
+- Proveedor IA opcional e intercambiable
+- Grafo lógico persistido sobre tablas
+- JSON/OpenAPI como contrato con MNEMO
+
+Eso, a mi juicio, es la versión más brillante precisamente porque es la menos caótica.
+
+
+Qué opinas de mi ste sujeto
